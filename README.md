@@ -12,9 +12,13 @@ CF优选IP powershell工具
 <img width="1129" height="635" alt="image" src="https://github.com/user-attachments/assets/5f28c857-6b8c-4915-b46c-72bb0ebab205" />
 
 🙏 特别注意与致谢
+
 ❇️ 特别注意：下载后，须将文件夹解压至：D:\CF优选IP 文件目录下。如需自定义目录可自行修改
+
 ❇️ 众多IP段：内含CF官方IP库与部分网上搜集IP段，总计2w9个IP
+
 ❇️ 如需自行调节参数，请参看https://github.com/ShadowObj/CloudflareSpeedTest 参数设定。
+
 ❇️ 自带格式输出：IP国家国旗 | 城市名称 | 自定义名称  例如：🇭🇺 | Budapest | CF优选  
 
 ⚖️ 免责声明
