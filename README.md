@@ -32,9 +32,13 @@ CF优选IP powershell工具
 ❇️ 自带格式输出：IP国家国旗 | 城市名称 | 自定义名称  例如：🇭🇺 | Budapest | CF优选  
 
 🛠️ 系统要求
+
 Windows 10/11
-无需安装 Python，直接运行
+
+无需安装任何程序，直接运行
+
 🔍 运行常见问题
+
 扫描结果出现下载速度测试为零时，请去 https://github.com/XIU2/CloudflareSpeedTest 下载最新的版本后，修改扫描器名称为CloudflareSpeedTest.exe进行替换即可
 
 ⚖️ 免责声明
