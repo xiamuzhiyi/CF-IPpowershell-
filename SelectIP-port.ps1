@@ -10,11 +10,11 @@
     # 自定义后缀名称
     [string]$CustomSuffix = "CF优选",
     # GitHub Personal Access Token（留空则不上传）
-    [string]$GitHubToken = "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",
+    [string]$GitHubToken = "",
     # GitHub 仓库 (owner/repo)
-    [string]$GitHubRepo = "xiagefei/CFBestIP",
+    [string]$GitHubRepo = "",
     # 仓库内目标文件路径
-    [string]$GitHubPath = "addressesapi.txt",
+    [string]$GitHubPath = "",
     # 目标分支
     [string]$GitHubBranch = "main"
 )
