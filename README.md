@@ -42,6 +42,7 @@ Windows 10/11
 扫描结果出现下载速度测试为零时，请去 https://github.com/XIU2/CloudflareSpeedTest 下载最新的版本后，修改扫描器名称为CloudflareSpeedTest.exe进行替换即可
 
 ⚖️ 免责声明
+
 本项目仅供技术交流与学习使用，请勿用于非法用途。使用本程序产生的任何后果由使用者自行承担。
 
 ## Star History
