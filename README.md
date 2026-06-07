@@ -23,3 +23,14 @@ CF优选IP powershell工具
 
 ⚖️ 免责声明
 本项目仅供技术交流与学习使用，请勿用于非法用途。使用本程序产生的任何后果由使用者自行承担。
+
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=xiamuzhiyi%2FCF-IPpowershell-&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=xiamuzhiyi/CF-IPpowershell-&type=date&theme=dark&legend=bottom-right" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=xiamuzhiyi/CF-IPpowershell-&type=date&legend=bottom-right" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=xiamuzhiyi/CF-IPpowershell-&type=date&legend=bottom-right" />
+ </picture>
+</a>
