@@ -54,3 +54,7 @@ Windows 10/11
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=xiamuzhiyi/CF-IPpowershell-&type=date&legend=bottom-right" />
  </picture>
 </a>
+
+🌟 支持
+
+如果这个项目对你有帮助，请给我一个 ⭐️！
