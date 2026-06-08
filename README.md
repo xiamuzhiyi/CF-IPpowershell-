@@ -1,6 +1,6 @@
-CF优选IP powershell工具
+红星闪闪 CF优选 powershell优选IP工具！！
 
-这是一个基于 powershell的CF优选工具，解决按照一大堆运行环境的问题，一键启动，如需自动上传至GITHUB版本，将在后续放出！
+这是一个基于 powershell的CF优选工具，解决按照一大堆运行环境的问题，一键启动，如需自动上传至GITHUB版本，2026-06-08此版本将会是最终版本，不在更新！
 
 🎯 基本介绍
 通过powershell自定义优选，执行批处理文件.bat文件即可
@@ -12,18 +12,20 @@ CF优选IP powershell工具
 
 2、直接运行run_XXXXXX.bat文件即可
 
-3、run_IPGeoFormat.bat  对IP.TXT文件进行格式化  🇭🇺 | Budapest | CF优选，单独功能提取，方便对本身存在的文件进行格式化
+3、run_IPGeoFormat.bat  对IP.TXT文件进行格式化  🇭🇺 | Budapest | CF优选，单独功能提取，支持github上传，方便对本身存在的文件进行格式化
 
 4、run_SelectIP-github.bat 支持上传github版本，请修改github相关资料
 
-5、run_SelectiP-port.bat 支持上传github，自定义端口 如：443、2096端口等
+5、run_SelectiP-port.bat 支持上传github，自定义端口 如：443、2096端口等，更新测速源检测保障了下载测速的有效性
 
 6、run_SelectiP.bat 初始版本，功能不完善，请注意，只能实现IP扫描和格式输出
 
 🚀 项目截图
 <img width="1103" height="424" alt="image" src="https://github.com/user-attachments/assets/63a25835-1104-4793-8ff3-330f01c93d45" />
 <img width="1129" height="635" alt="image" src="https://github.com/user-attachments/assets/99cc9370-f23b-4c2a-987c-b7be925273cb" />
-<img width="1129" height="635" alt="image" src="https://github.com/user-attachments/assets/5f28c857-6b8c-4915-b46c-72bb0ebab205" />
+<img width="618" height="284" alt="image" src="https://github.com/user-attachments/assets/444136d5-3545-4ac0-a4cb-fb27363bda9c" />
+<img width="1100" height="563" alt="image" src="https://github.com/user-attachments/assets/82624e01-be93-4ac8-a953-f131e2b827ae" />
+
 
 🙏 特别注意与致谢
 
