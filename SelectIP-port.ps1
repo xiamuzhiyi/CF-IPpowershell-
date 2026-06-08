@@ -1,29 +1,49 @@
-﻿param(
+param(
     # 默认测试 IP 数量
     [int]$DN_COUNT = 20,
-    # 优先选择区域: 香港(HKG)|新加坡(SIN)|日本(NRT)|韩国(ICN)|台湾(TPE)
+    # 下载速度下限，单位 MB/s（-sl）
+    [int]$MinSpeed = 30,
+    # 单个 IP 下载测速最长时间（-dt）
+    [int]$DownloadTestTime = 10,
+    # 优先选择区域
     [string]$CFCOLO = "HKG,SIN,NRT,ICN,TPE",
-    # 工作目录（默认与脚本同目录）
+    # 工作目录
     [string]$BaseDir = $PSScriptRoot,
     # 输出端口号（0 = 交互式输入）
     [int]$Port = 0,
     # 自定义后缀名称
     [string]$CustomSuffix = "CF优选",
-    # GitHub Personal Access Token（留空则不上传）
+    # GitHub Token（留空则不上传）
     [string]$GitHubToken = "",
-    # GitHub 仓库 (owner/repo)
+    # GitHub 仓库
     [string]$GitHubRepo = "",
     # 仓库内目标文件路径
     [string]$GitHubPath = "",
     # 目标分支
-    [string]$GitHubBranch = "main"
+    [string]$GitHubBranch = "main",
+    # 延迟测速并发线程数（-n）
+    [int]$Threads = 200,
+    # 延迟测速阶段的延迟上限
+    [int]$DelayMaxLatency = 300,
+    # 优先选择的延迟阈值，不达标也会保留，只是排序靠后
+    [int]$PreferredLatency = 200,
+    # 进入下载测速阶段的候选 IP 数量（0 = 使用全部延迟测速可用 IP）
+    [int]$DownloadCandidateCount = 0,
+    # 下载测速模式：LatencyTop = 按延迟排名优先测速，达到 DN_COUNT 个达标结果即停止；Full = 测完全部候选
+    [ValidateSet("LatencyTop", "Full")]
+    [string]$DownloadTestMode = "LatencyTop"
 )
+
 
 # ============================================
 # 全局错误处理
 # ============================================
 $ErrorActionPreference = "Continue"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+} catch {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
 
 # 安全退出函数：确保在显示错误信息后暂停，不会闪退
 function Exit-Script {
@@ -35,10 +55,138 @@ function Exit-Script {
 }
 
 # ============================================
+# 通用测速源池
+# ============================================
+
+$SpeedSources = @(
+    @{
+        Name = "Cloudflare"
+        Url  = "https://speed.cloudflare.com/__down?bytes=200000000"
+    },
+    @{
+        Name = "GeFei"
+        Url  = "https://speed.5ai.kdns.fr/200M"
+    },             
+    @{
+        Name = "第三方源"
+        Url  = "https://speedtest.order.xx.kg/200M"
+    }
+)
+
+# ============================================
+# 新增健康检查函数
+# ============================================
+
+function Test-SpeedSource {
+    param(
+        [string]$Url,
+        [int]$TimeoutSec = 5
+    )
+
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+        $probeUrl = $Url
+        if ($probeUrl -match '([?&])bytes=\d+') {
+            $probeUrl = $probeUrl -replace 'bytes=\d+', 'bytes=1048576'
+        }
+
+        $timeoutMs = [Math]::Max(1, $TimeoutSec) * 1000
+        $request = [System.Net.HttpWebRequest] [System.Net.WebRequest]::Create($probeUrl)
+        $request.Method = "HEAD"
+        $request.Timeout = $timeoutMs
+        $request.ReadWriteTimeout = $timeoutMs
+        $request.UserAgent = "CloudflareSpeedTest-SourceProbe/1.0"
+
+        try {
+            $response = $request.GetResponse()
+            $response.Close()
+        } catch {
+            # Some speed-test endpoints reject HEAD, but still work for downloads.
+            $request = [System.Net.HttpWebRequest] [System.Net.WebRequest]::Create($probeUrl)
+            $request.Method = "GET"
+            $request.Timeout = $timeoutMs
+            $request.ReadWriteTimeout = $timeoutMs
+            $request.UserAgent = "CloudflareSpeedTest-SourceProbe/1.0"
+            $request.AddRange(0, 1023)
+
+            $response = $request.GetResponse()
+            $stream = $response.GetResponseStream()
+            $buffer = New-Object byte[] 1024
+            $null = $stream.Read($buffer, 0, $buffer.Length)
+            $stream.Close()
+            $response.Close()
+        }
+
+        $sw.Stop()
+
+        return @{
+            Success = $true
+            Latency = $sw.ElapsedMilliseconds
+        }
+
+    } catch {
+
+        return @{
+            Success = $false
+            Latency = 999999
+        }
+    }
+}
+
+# ============================================
+# 新增测速源选择函数
+# ============================================
+
+function Get-BestSpeedSource {
+    param(
+        [string[]]$ExcludeUrls = @()
+    )
+
+    $available = @()
+
+    foreach ($source in $SpeedSources) {
+
+        if ($ExcludeUrls -contains $source.Url) {
+            Write-Host "跳过已失败测速源: $($source.Name)" -ForegroundColor DarkGray
+            continue
+        }
+
+        Write-Host "检测测速源: $($source.Name)" -ForegroundColor Gray
+
+        $result = Test-SpeedSource $source.Url
+
+        if ($result.Success) {
+
+            Write-Host "  ✅ 测速源可用！ ($($result.Latency) ms)" -ForegroundColor Green
+
+            $available += [PSCustomObject]@{
+                Name    = $source.Name
+                Url     = $source.Url
+                Latency = $result.Latency
+            }
+
+        } else {
+
+            Write-Host "  ❌ 测速源不可用" -ForegroundColor Yellow
+        }
+    }
+
+    if ($available.Count -eq 0) {
+        return $null
+    }
+
+    return ($available | Sort-Object Latency | Select-Object -First 1)
+}
+
+# ============================================
 # 定义路径
 # ============================================
 $CFSPEED_EXEC       = Join-Path $BaseDir "CloudflareSpeedtest.exe"
 $CLOUDFLARE_IP_FILE = Join-Path $BaseDir "Cloudflare.txt"
+$LATENCY_FILE       = Join-Path $BaseDir "latency_result.csv"
+$DOWNLOAD_IP_FILE   = Join-Path $BaseDir "download_candidates.txt"
+$SPEED_SOURCE_PROBE_FILE = Join-Path $BaseDir "speed_source_probe.csv"
 $RESULT_FILE        = Join-Path $BaseDir "result.csv"
 $FILTERED_FILE      = Join-Path $BaseDir "filtered_result.csv"
 $PURE_FILE          = Join-Path $BaseDir "pure_result.csv"
@@ -124,20 +272,337 @@ if (-Not (Test-Path $CLOUDFLARE_IP_FILE) -or (Get-Item $CLOUDFLARE_IP_FILE).Leng
 # ============================================
 Write-Host "[3/6] 运行 CloudflareSpeedTest 测速..." -ForegroundColor Yellow
 
-$ARGS = "-dn $DN_COUNT -sl 1 -tl 300 -tp $Port -f `"$CLOUDFLARE_IP_FILE`" -o `"$RESULT_FILE`""
-if ($CFCOLO -and $CFCOLO.Trim() -ne "") {
-    $ARGS += " -cfcolo $CFCOLO"
-    Write-Host "  优先区域: $CFCOLO" -ForegroundColor Gray
+$SelectedSource = Get-BestSpeedSource
+
+if ($null -eq $SelectedSource) {
+    Write-Host "警告: 所有自定义测速源均不可用，将使用 CloudflareSpeedTest 默认测速地址继续..." -ForegroundColor Red
 }
 
-Write-Host "  执行测速（请耐心等待）..." -ForegroundColor Gray
-try {
-    $proc = Start-Process -FilePath $CFSPEED_EXEC -ArgumentList $ARGS -Wait -PassThru -NoNewWindow
-    if ($proc.ExitCode -ne 0) {
-        Write-Host "  测速完成（退出码: $($proc.ExitCode)）" -ForegroundColor Yellow
+Write-Host ""
+if ($SelectedSource) {
+    Write-Host "当前测速源: $($SelectedSource.Name)" -ForegroundColor Green
+    Write-Host "测速地址: $($SelectedSource.Url)" -ForegroundColor Gray
+} else {
+    Write-Host "未选择自定义测速源（使用默认）" -ForegroundColor Green
+}
+Write-Host ""
+
+# --- 两阶段测速：先延迟测速拿候选，再下载测速 ---
+function Convert-ToNumber {
+    param([string]$Value, [double]$Default = 999999)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Value)) { return $Default }
+        return [double]$Value
+    } catch {
+        return $Default
     }
-} catch {
-    Write-Host "  测速执行异常: $_" -ForegroundColor Red
+}
+
+function Test-CsvHasData {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $false }
+    if ((Get-Item $Path).Length -eq 0) { return $false }
+
+    $rows = Get-Content -Path $Path -Encoding UTF8 -TotalCount 2
+    return ($rows.Count -ge 2 -and -not [string]::IsNullOrWhiteSpace($rows[1]))
+}
+
+function Get-TargetColos {
+    if (-not $CFCOLO -or $CFCOLO.Trim() -eq "") { return @() }
+    return @($CFCOLO -split ',' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
+}
+
+function New-CFSpeedArgs {
+    param(
+        [object]$SpeedSource,
+        [string]$InputFile,
+        [string]$OutputFile,
+        [string[]]$IPList = @(),
+        [bool]$UseHttping = $false,
+        [bool]$DisableDownload = $false,
+        [int]$LatencyLimit = $DelayMaxLatency,
+        [int]$DownloadCount = $DN_COUNT,
+        [double]$SpeedLimit = 0
+    )
+
+    $cfSpeedArgs = @(
+        '-n', $Threads
+        '-tl', $LatencyLimit
+        '-tp', $Port
+        '-o', $OutputFile
+    )
+
+    if ($IPList -and $IPList.Count -gt 0) {
+        $cfSpeedArgs += @('-ip', ($IPList -join ','))
+    } else {
+        $cfSpeedArgs += @('-f', $InputFile)
+    }
+
+    if ($DisableDownload) {
+        $cfSpeedArgs += @('-dd')
+    } else {
+        $cfSpeedArgs += @('-dn', $DownloadCount, '-sl', $SpeedLimit, '-dt', $DownloadTestTime)
+    }
+
+    if ($UseHttping) {
+        $cfSpeedArgs += @('-httping')
+    }
+
+    if ($SpeedSource -and $SpeedSource.Url) {
+        $cfSpeedArgs += @('-url', $SpeedSource.Url)
+    }
+
+    return $cfSpeedArgs
+}
+
+function Invoke-CFSpeed {
+    param(
+        [string]$Name,
+        [array]$CfArgs,
+        [string]$OutputFile,
+        [bool]$Quiet = $false
+    )
+
+    Write-Host ""
+    Write-Host "  正在执行程序: $Name" -ForegroundColor Cyan
+    if (Test-Path $OutputFile) {
+        Remove-Item -LiteralPath $OutputFile -Force -ErrorAction SilentlyContinue
+    }
+
+    try {
+        # CloudflareSpeedTest prints "press Enter to exit" after each run.
+        # Supplying one newline prevents the script from hanging between stages.
+        if ($Quiet) {
+            '' | & $CFSPEED_EXEC @CfArgs 2>&1 | Out-Null
+        } else {
+            '' | & $CFSPEED_EXEC @CfArgs
+        }
+        $exitCode = $LASTEXITCODE
+    } catch {
+        $exitCode = 1
+        Write-Host "  测速程序调用异常: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    return @{ Success = ($exitCode -eq 0 -and (Test-CsvHasData -Path $OutputFile)); ExitCode = $exitCode }
+}
+
+function Get-PrioritizedRowsFromCsv {
+    param(
+        [string]$InputFile,
+        [int]$Limit = 0,
+        [bool]$RegionFirst = $true
+    )
+
+    $targetColos = Get-TargetColos
+    $csvContent = Get-Content $InputFile -Encoding UTF8
+    if ($csvContent.Count -le 1) { return @() }
+
+    $items = @()
+    for ($i = 1; $i -lt $csvContent.Count; $i++) {
+        $line = $csvContent[$i].Trim()
+        if ([string]::IsNullOrEmpty($line)) { continue }
+        $fields = $line -split ','
+        if ($fields.Count -lt 5) { continue }
+
+        $ip = $fields[0].Trim()
+        $loss = if ($fields.Count -ge 4) { Convert-ToNumber $fields[3] 100 } else { 100 }
+        $latency = if ($fields.Count -ge 5) { Convert-ToNumber $fields[4] 999999 } else { 999999 }
+        $speed = if ($fields.Count -ge 6) { Convert-ToNumber $fields[5] 0 } else { 0 }
+        $colo = if ($fields.Count -ge 7) { $fields[6].Trim().ToUpper() } else { "" }
+
+        $items += [PSCustomObject]@{
+            Line            = $line
+            IP              = $ip
+            Latency         = $latency
+            Loss            = $loss
+            Speed           = $speed
+            Colo            = $colo
+            RegionPriority  = if ($targetColos.Count -gt 0 -and $targetColos -contains $colo) { 0 } else { 1 }
+            LatencyPriority = if ($latency -le $PreferredLatency) { 0 } else { 1 }
+            LossPriority    = if ($loss -le 0) { 0 } else { 1 }
+            SpeedPriority   = if ($speed -ge $MinSpeed) { 0 } else { 1 }
+        }
+    }
+
+    if ($RegionFirst) {
+        $sorted = $items | Sort-Object RegionPriority, LatencyPriority, LossPriority, @{Expression='Latency'; Ascending=$true}, @{Expression='Loss'; Ascending=$true}
+    } else {
+        $sorted = $items | Sort-Object @{Expression='Latency'; Ascending=$true}, @{Expression='Loss'; Ascending=$true}
+    }
+    if ($Limit -gt 0) {
+        return @($sorted | Select-Object -First $Limit)
+    }
+    return @($sorted)
+}
+
+function Get-MaxDownloadSpeedFromCsv {
+    param([string]$InputFile)
+
+    if (-not (Test-Path $InputFile)) { return 0 }
+    $csvContent = Get-Content $InputFile -Encoding UTF8
+    if ($csvContent.Count -le 1) { return 0 }
+
+    $maxSpeed = 0
+    for ($i = 1; $i -lt $csvContent.Count; $i++) {
+        $line = $csvContent[$i].Trim()
+        if ([string]::IsNullOrEmpty($line)) { continue }
+        $fields = $line -split ','
+        if ($fields.Count -ge 6) {
+            $speed = Convert-ToNumber $fields[5] 0
+            if ($speed -gt $maxSpeed) { $maxSpeed = $speed }
+        }
+    }
+    return $maxSpeed
+}
+
+function Get-BestDownloadSpeedSource {
+    param(
+        [string[]]$ProbeIPs,
+        [int]$ProbeCount = 1
+    )
+
+    $sources = @()
+    foreach ($source in $SpeedSources) {
+        $sources += [PSCustomObject]@{
+            Name = $source.Name
+            Url  = $source.Url
+        }
+    }
+    $sources += [PSCustomObject]@{
+        Name = "CloudflareSpeedTest 默认源"
+        Url  = $null
+    }
+
+    $bestSource = $null
+    $bestSpeed = 0
+    $probeList = @($ProbeIPs | Where-Object { $_ } | Select-Object -First 20)
+    if ($probeList.Count -eq 0) { return $null }
+
+    Write-Host ""
+    Write-Host "  正在真实探测下载测速源..." -ForegroundColor Cyan
+
+    foreach ($source in $sources) {
+        Write-Host "  探测测速源: $($source.Name)" -ForegroundColor Gray
+
+        $probeSource = [PSCustomObject]@{ Name = $source.Name; Url = $source.Url }
+
+        $probeArgs = New-CFSpeedArgs `
+            -SpeedSource $probeSource `
+            -InputFile $CLOUDFLARE_IP_FILE `
+            -OutputFile $SPEED_SOURCE_PROBE_FILE `
+            -IPList $probeList `
+            -UseHttping $false `
+            -DisableDownload $false `
+            -LatencyLimit $DelayMaxLatency `
+            -DownloadCount $ProbeCount `
+            -SpeedLimit 0
+
+        $probeResult = Invoke-CFSpeed -Name "测速源探测 - $($source.Name)" -CfArgs $probeArgs -OutputFile $SPEED_SOURCE_PROBE_FILE -Quiet $true
+        $maxSpeed = if ($probeResult.Success) { Get-MaxDownloadSpeedFromCsv -InputFile $SPEED_SOURCE_PROBE_FILE } else { 0 }
+
+        Write-Host "    最高速度: $maxSpeed MB/s" -ForegroundColor DarkGray
+        if ($maxSpeed -gt $bestSpeed) {
+            $bestSpeed = $maxSpeed
+            $bestSource = $probeSource
+        }
+    }
+
+    if (Test-Path $SPEED_SOURCE_PROBE_FILE) {
+        Remove-Item -LiteralPath $SPEED_SOURCE_PROBE_FILE -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($bestSpeed -le 0) {
+        Write-Host "  未找到可产生下载速度的测速源，将继续使用原测速源，但结果可能为 0。" -ForegroundColor Yellow
+        return $null
+    }
+
+    if ($bestSource -and $bestSource.Url) {
+        Write-Host "  选定下载测速源: $($bestSource.Name) ($bestSpeed MB/s)" -ForegroundColor Green
+    } else {
+        Write-Host "  选定下载测速源: CloudflareSpeedTest 默认源 ($bestSpeed MB/s)" -ForegroundColor Green
+    }
+    return $bestSource
+}
+
+if ($CFCOLO -and $CFCOLO.Trim() -ne "") {
+    Write-Host "  优先区域: $CFCOLO（仅排序优先）" -ForegroundColor Gray
+}
+Write-Host "  延迟优先阈值: $PreferredLatency ms（超过阈值放弃）" -ForegroundColor Gray
+Write-Host "  执行两阶段测速（TCPing 延迟测速，下载测速）..." -ForegroundColor Gray
+
+$latencyPlans = @(
+    @{
+        Name = " 🌟🌟🌟 延迟测速 TCPing 宽松模式"
+        Args = New-CFSpeedArgs -SpeedSource $null -InputFile $CLOUDFLARE_IP_FILE -OutputFile $LATENCY_FILE -UseHttping $false -DisableDownload $true -LatencyLimit $DelayMaxLatency
+    }
+)
+
+$latencySucceeded = $false
+$exitCode = $null
+foreach ($plan in $latencyPlans) {
+    $planResult = Invoke-CFSpeed -Name $plan.Name -CfArgs $plan.Args -OutputFile $LATENCY_FILE -Quiet $false
+    $exitCode = $planResult.ExitCode
+    if ($planResult.Success) {
+        $latencySucceeded = $true
+        break
+    }
+}
+
+if (-not $latencySucceeded) {
+    if ($null -ne $exitCode -and $exitCode -ne 0) {
+        Write-Host "  最后一次延迟测速退出码: $exitCode" -ForegroundColor Yellow
+    }
+    Exit-Script "延迟测速失败：未获取到任何可用 IP。"
+}
+
+$useFullDownloadMode = ($DownloadTestMode -eq "Full")
+$candidateLimit = if ($DownloadCandidateCount -gt 0) { [Math]::Max($DN_COUNT, $DownloadCandidateCount) } else { 0 }
+$candidateRows = Get-PrioritizedRowsFromCsv -InputFile $LATENCY_FILE -Limit $candidateLimit -RegionFirst $useFullDownloadMode
+if ($candidateRows.Count -eq 0) {
+    Exit-Script "延迟测速结果为空，无法进入下载测速。"
+}
+
+$candidateIPs = @($candidateRows | Select-Object -ExpandProperty IP)
+$candidateIPs | Out-File -FilePath $DOWNLOAD_IP_FILE -Encoding ascii -Force
+Write-Host "  延迟测速候选: $($candidateRows.Count) 个，已写入 $DOWNLOAD_IP_FILE" -ForegroundColor Green
+if ($useFullDownloadMode) {
+    Write-Host "  下载测速模式: Full（测完候选清单全部 IP）" -ForegroundColor Gray
+} else {
+    Write-Host "  下载测速模式: LatencyTop（按延迟排名优先，达到 $DN_COUNT 个速度 >= $MinSpeed MB/s 的结果即停止）" -ForegroundColor Gray
+}
+
+$downloadCount = if ($useFullDownloadMode) { $candidateIPs.Count } else { $DN_COUNT }
+$downloadSpeedLimit = if ($useFullDownloadMode) { 0 } else { $MinSpeed }
+$downloadSource = Get-BestDownloadSpeedSource -ProbeIPs $candidateIPs -ProbeCount 3
+if ($null -eq $downloadSource -and $SelectedSource) {
+    $downloadSource = $SelectedSource
+}
+$downloadPlans = @(
+    @{
+        Name = " 🌟🌟🌟 下载测速 TCPing 宽松模式"
+        Args = New-CFSpeedArgs -SpeedSource $downloadSource -InputFile $DOWNLOAD_IP_FILE -OutputFile $RESULT_FILE -UseHttping $false -DisableDownload $false -LatencyLimit $DelayMaxLatency -DownloadCount $downloadCount -SpeedLimit $downloadSpeedLimit
+    }
+)
+
+$downloadSucceeded = $false
+foreach ($plan in $downloadPlans) {
+    $planResult = Invoke-CFSpeed -Name $plan.Name -CfArgs $plan.Args -OutputFile $RESULT_FILE -Quiet $false
+    $exitCode = $planResult.ExitCode
+    if ($planResult.Success) {
+        $downloadSucceeded = $true
+        break
+    }
+}
+
+if (-not $downloadSucceeded) {
+    if ($null -ne $exitCode -and $exitCode -ne 0) {
+        Write-Host "  最后一次下载测速退出码: $exitCode" -ForegroundColor Yellow
+    }
+    Exit-Script "下载测速失败：候选 IP 未生成有效下载测速结果。"
+}
+
+if ($exitCode -ne 0) {
+    Write-Host "  测速完成（退出码: $exitCode）" -ForegroundColor Yellow
 }
 
 if (-Not (Test-Path $RESULT_FILE)) {
@@ -146,133 +611,134 @@ if (-Not (Test-Path $RESULT_FILE)) {
 Write-Host "  测速完成，结果: $RESULT_FILE" -ForegroundColor Green
 
 # ============================================
-# 步骤4: 地区筛选 (HKG, SIN, NRT, ICN, TPE)
+# 步骤4: 地区优先排序 (HKG, SIN, NRT, ICN, TPE)
 # ============================================
-Write-Host "[4/6] 地区筛选（仅保留亚洲目标区域）..." -ForegroundColor Yellow
+Write-Host "[4/6] 地区优先排序（目标区域靠前，不过滤）..." -ForegroundColor Yellow
 
-function Filter-IPByRegion {
+function Sort-IPByRegionPriority {
     param([string]$InputFile, [string]$OutputFile)
-    $targetColos = @("HKG", "SIN", "NRT", "ICN", "TPE")
+    $targetColos = Get-TargetColos
 
     $csvContent = Get-Content $InputFile -Encoding UTF8
     if ($csvContent.Count -le 1) {
-        Write-Host "  测速结果为空或仅有表头，跳过筛选" -ForegroundColor Yellow
+        Write-Host "  测速结果为空或仅有表头，跳过地区排序" -ForegroundColor Yellow
         return @{ Success = $false }
     }
 
-    # 统计实际出现的区域
     $allColos = @{}
-    $filtered = @($csvContent[0])
+    $items = @()
     for ($i = 1; $i -lt $csvContent.Count; $i++) {
         $line = $csvContent[$i].Trim()
         if ([string]::IsNullOrEmpty($line)) { continue }
         $fields = $line -split ','
-        if ($fields.Count -ge 6) {
-            $coloCode = $fields[5].Trim()
-            if (-not $allColos.ContainsKey($coloCode)) { $allColos[$coloCode] = 0 }
-            $allColos[$coloCode]++
-            if ($targetColos -contains $coloCode) {
-                $filtered += $line
-            }
+
+        $coloCode = if ($fields.Count -ge 7) { $fields[6].Trim().ToUpper() } else { "" }
+        $latency = if ($fields.Count -ge 5) { Convert-ToNumber $fields[4] 999999 } else { 999999 }
+        $loss = if ($fields.Count -ge 4) { Convert-ToNumber $fields[3] 100 } else { 100 }
+        $speed = if ($fields.Count -ge 6) { Convert-ToNumber $fields[5] 0 } else { 0 }
+
+        if (-not $allColos.ContainsKey($coloCode)) { $allColos[$coloCode] = 0 }
+        $allColos[$coloCode]++
+
+        $items += [PSCustomObject]@{
+            Line           = $line
+            Colo           = $coloCode
+            RegionPriority = if ($targetColos.Count -gt 0 -and $targetColos -contains $coloCode) { 0 } else { 1 }
+            Latency        = $latency
+            Loss           = $loss
+            Speed          = $speed
         }
     }
 
-    $total = $csvContent.Count - 1
-    $filteredCount = $filtered.Count - 1
-
-    # 显示实际区域分布
     Write-Host "  测到区域分布:" -ForegroundColor Gray
     foreach ($c in $allColos.Keys | Sort-Object) {
-        Write-Host "    $c x$($allColos[$c])" -ForegroundColor DarkGray
-    }
-    Write-Host "  原始: $total 个 | 筛选后: $filteredCount 个（目标: $($targetColos -join '/')）" -ForegroundColor Gray
-
-    # 兜底：无目标区域IP时，使用全部IP继续
-    if ($filteredCount -eq 0) {
-        Write-Host "  未找到目标区域IP，自动使用全部测速结果继续..." -ForegroundColor Yellow
-        $filtered = $csvContent
-        $filteredCount = $total
+        $name = if ([string]::IsNullOrWhiteSpace($c)) { "(未知)" } else { $c }
+        Write-Host "    $name x$($allColos[$c])" -ForegroundColor DarkGray
     }
 
-    $filtered | Out-File -FilePath $OutputFile -Encoding UTF8 -Force
-    return @{ Success = $true; Count = $filteredCount }
+    $sortedLines = @($csvContent[0])
+    $sortedLines += @($items | Sort-Object RegionPriority, @{Expression='Speed'; Descending=$true}, @{Expression='Latency'; Ascending=$true}, @{Expression='Loss'; Ascending=$true} | Select-Object -ExpandProperty Line)
+    $sortedLines | Out-File -FilePath $OutputFile -Encoding UTF8 -Force
+
+    $preferredCount = @($items | Where-Object { $_.RegionPriority -eq 0 }).Count
+    Write-Host "  原始: $($items.Count) 个 | 目标区域优先: $preferredCount 个（目标: $($targetColos -join '/')）" -ForegroundColor Gray
+    return @{ Success = $true; Count = $items.Count; Preferred = $preferredCount }
 }
 
-$regionResult = Filter-IPByRegion -InputFile $RESULT_FILE -OutputFile $FILTERED_FILE
+$regionResult = Sort-IPByRegionPriority -InputFile $RESULT_FILE -OutputFile $FILTERED_FILE
 
 # ============================================
-# 步骤5: 纯净度筛选 (延迟 <= 200ms, 丢包率 = 0%)
+# 步骤5: 纯净度/速度优先排序
 # ============================================
-Write-Host "[5/6] 纯净度筛选（延迟<=200ms & 丢包率=0%）..." -ForegroundColor Yellow
+Write-Host "[5/6] 纯净度/速度优先排序（不满足也保留）..." -ForegroundColor Yellow
 
-function Filter-IPByPurity {
+function Sort-IPByQualityPriority {
     param(
         [string]$InputFile,
         [string]$OutputFile,
-        [int]$MaxLatency = 200,
-        [int]$MaxLoss = 0
+        [int]$MaxLatency = $PreferredLatency,
+        [int]$MaxLoss = 0,
+        [double]$MinDownloadSpeed = $MinSpeed,
+        [int]$OutputLimit = $DN_COUNT
     )
 
     if (-Not (Test-Path $InputFile)) {
-        Write-Host "  输入文件不存在，跳过纯净度筛选" -ForegroundColor Yellow
+        Write-Host "  输入文件不存在，跳过质量排序" -ForegroundColor Yellow
         return @()
     }
 
     $csvContent = Get-Content $InputFile -Encoding UTF8
     if ($csvContent.Count -le 1) {
-        Write-Host "  输入文件为空，跳过" -ForegroundColor Yellow
+        Write-Host "  输入文件为空，跳过质量排序" -ForegroundColor Yellow
         return @()
     }
 
-    $filtered = @($csvContent[0])
-    $ipList = @()
+    $items = @()
     for ($i = 1; $i -lt $csvContent.Count; $i++) {
         $line = $csvContent[$i].Trim()
         if ([string]::IsNullOrEmpty($line)) { continue }
         $fields = $line -split ','
-        if ($fields.Count -ge 6) {
+        if ($fields.Count -ge 1) {
             $ip      = $fields[0].Trim()
-            $latency = try { [double]$fields[1] } catch { 999 }
-            $loss    = try { [double]$fields[4] } catch { 100 }
+            $loss    = if ($fields.Count -ge 4) { Convert-ToNumber $fields[3] 100 } else { 100 }
+            $latency = if ($fields.Count -ge 5) { Convert-ToNumber $fields[4] 999999 } else { 999999 }
+            $speed   = if ($fields.Count -ge 6) { Convert-ToNumber $fields[5] 0 } else { 0 }
 
-            if ($latency -le $MaxLatency -and $loss -le $MaxLoss) {
-                $filtered += $line
-                $ipList += $ip
+            $items += [PSCustomObject]@{
+                Line            = $line
+                IP              = $ip
+                Latency         = $latency
+                Loss            = $loss
+                Speed           = $speed
+                SpeedPriority   = if ($speed -ge $MinDownloadSpeed) { 0 } else { 1 }
+                LatencyPriority = if ($latency -le $MaxLatency) { 0 } else { 1 }
+                LossPriority    = if ($loss -le $MaxLoss) { 0 } else { 1 }
             }
         }
     }
 
-    $filtered | Out-File -FilePath $OutputFile -Encoding UTF8 -Force
-    $total = $csvContent.Count - 1
-    $filteredCount = $filtered.Count - 1
-    Write-Host "  原始: $total 个 | 筛选后: $filteredCount 个（纯净IP）" -ForegroundColor Gray
-    return $ipList
-}
-
-$pureIPs = Filter-IPByPurity -InputFile $FILTERED_FILE -OutputFile $PURE_FILE -MaxLatency 200 -MaxLoss 0
-
-if ($pureIPs.Count -eq 0) {
-    Write-Host ""
-    Write-Host "  纯净IP数为0，放宽丢包率限制重试（丢包率<=5%）..." -ForegroundColor Yellow
-    $pureIPs = Filter-IPByPurity -InputFile $FILTERED_FILE -OutputFile $PURE_FILE -MaxLatency 200 -MaxLoss 5
-}
-
-if ($pureIPs.Count -eq 0) {
-    Write-Host ""
-    Write-Host "  筛选无结果，跳过筛选，使用全部测速IP直接输出..." -ForegroundColor Yellow
-    # 从原始 result.csv 提取全部IP（跳过表头）
-    $rawCsv = Get-Content $RESULT_FILE -Encoding UTF8
-    $pureIPs = @()
-    for ($i = 1; $i -lt $rawCsv.Count; $i++) {
-        $line = $rawCsv[$i].Trim()
-        if ([string]::IsNullOrEmpty($line)) { continue }
-        $fields = $line -split ','
-        if ($fields.Count -ge 1) {
-            $pureIPs += $fields[0].Trim()
-        }
+    $sortedItems = @($items | Sort-Object @{Expression='Speed'; Descending=$true}, @{Expression='Latency'; Ascending=$true}, @{Expression='Loss'; Ascending=$true})
+    if ($OutputLimit -gt 0) {
+        $sortedItems = @($sortedItems | Select-Object -First $OutputLimit)
     }
-    Write-Host "  共提取 $($pureIPs.Count) 个IP，开始格式化..." -ForegroundColor Gray
+
+    $sortedLines = @($csvContent[0])
+    $sortedLines += @($sortedItems | Select-Object -ExpandProperty Line)
+    $sortedLines | Out-File -FilePath $OutputFile -Encoding UTF8 -Force
+
+    $speedOk = @($items | Where-Object { $_.Speed -ge $MinDownloadSpeed }).Count
+    $latencyOk = @($items | Where-Object { $_.Latency -le $MaxLatency }).Count
+    $lossOk = @($items | Where-Object { $_.Loss -le $MaxLoss }).Count
+    Write-Host "  原始: $($items.Count) 个 | 速度达标: $speedOk | 延迟达标: $latencyOk | 0丢包: $lossOk | 输出: $($sortedItems.Count) 个" -ForegroundColor Gray
+    return @($sortedItems | Select-Object -ExpandProperty IP)
 }
+
+$pureIPs = Sort-IPByQualityPriority -InputFile $FILTERED_FILE -OutputFile $PURE_FILE -MaxLatency $PreferredLatency -MaxLoss 0 -MinDownloadSpeed $MinSpeed -OutputLimit $DN_COUNT
+
+if ($pureIPs.Count -eq 0) {
+    Exit-Script "排序后没有可输出 IP。"
+}
+Write-Host "  按下载速度优选前 $($pureIPs.Count) 个IP，开始格式化..." -ForegroundColor Gray
 
 # ============================================
 # 步骤6: IP 地理信息查询 + 格式化输出
@@ -514,9 +980,11 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  优选任务完成！" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  原始测速数据:  $RESULT_FILE" -ForegroundColor DarkGray
-Write-Host "  地区筛选结果:  $FILTERED_FILE" -ForegroundColor DarkGray
-Write-Host "  纯净度筛选:    $PURE_FILE" -ForegroundColor DarkGray
+Write-Host "  延迟测速数据:      $LATENCY_FILE" -ForegroundColor DarkGray
+Write-Host "  下载候选IP:        $DOWNLOAD_IP_FILE" -ForegroundColor DarkGray
+Write-Host "  下载测速数据:      $RESULT_FILE" -ForegroundColor DarkGray
+Write-Host "  地区优先排序结果:  $FILTERED_FILE" -ForegroundColor DarkGray
+Write-Host "  质量优先排序结果:  $PURE_FILE" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  *** 格式化结果 ***" -ForegroundColor Green
 Write-Host "  文件: $FINAL_OUTPUT" -ForegroundColor Green
